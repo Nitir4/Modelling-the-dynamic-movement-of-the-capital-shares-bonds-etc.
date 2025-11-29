@@ -817,109 +817,6 @@ def generate_quarterly_summary(results_df, timeseries_df, params):
 # STEADY STATE & JACOBIAN (ORIGINAL FUNCTIONS)
 # ============================================================================
 
-def steady_state(params, fixed_risk_free_rate=None, initial_guess=None):
-    """Find steady-state capital allocation."""
-    if fixed_risk_free_rate is None:
-        fixed_risk_free_rate = params.get("risk_free_rate_baseline", 0.04)
-    
-    local_params = dict(params)
-    local_params["risk_free_rate_type"] = "constant"
-    local_params["risk_free_rate_baseline"] = fixed_risk_free_rate
-    
-    def residuals(variables):
-        stocks_allocation, bonds_allocation = variables
-        total_capital = local_params.get("total_capital", 1.0)
-        cash_allocation = total_capital - stocks_allocation - bonds_allocation
-        
-        if cash_allocation < 0:
-            return [1e3 * (stocks_allocation + bonds_allocation - total_capital), 
-                    1e3 * (stocks_allocation + bonds_allocation - total_capital)]
-        
-        current_stock_return = stock_return(fixed_risk_free_rate, local_params)
-        current_bond_return = bond_return(fixed_risk_free_rate, local_params)
-        
-        alpha_s = local_params.get("stock_sensitivity_to_excess_return", 0.5)
-        alpha_b = local_params.get("bond_sensitivity_to_excess_return", 0.4)
-        beta_s = local_params.get("cash_to_stocks_baseline_flow", 0.02)
-        beta_b = local_params.get("cash_to_bonds_baseline_flow", 0.03)
-        gamma_s = local_params.get("stock_natural_decay_rate", 0.01)
-        gamma_b = local_params.get("bond_natural_decay_rate", 0.01)
-        
-        stock_excess_return = current_stock_return - fixed_risk_free_rate
-        bond_excess_return = current_bond_return - fixed_risk_free_rate
-        
-        stocks_derivative = (alpha_s * stock_excess_return * stocks_allocation + 
-                            beta_s * cash_allocation - 
-                            gamma_s * stocks_allocation)
-        
-        bonds_derivative = (alpha_b * bond_excess_return * bonds_allocation + 
-                           beta_b * cash_allocation - 
-                           gamma_b * bonds_allocation)
-        
-        return [stocks_derivative, bonds_derivative]
-    
-    if initial_guess is None:
-        current_stock_return = stock_return(fixed_risk_free_rate, params)
-        current_bond_return = bond_return(fixed_risk_free_rate, params)
-        total_return = max(current_stock_return + current_bond_return, 1e-6)
-        total_capital = params.get("total_capital", 1.0)
-        initial_guess = [total_capital * current_stock_return / total_return, 
-                        total_capital * current_bond_return / total_return]
-    
-    solution = root(residuals, x0=initial_guess, method="hybr")
-    if not solution.success:
-        raise RuntimeError(f"Steady-state solver failed: {solution.message}")
-    
-    stocks_steady, bonds_steady = solution.x
-    total_capital = params.get("total_capital", 1.0)
-    cash_steady = total_capital - stocks_steady - bonds_steady
-    
-    return np.array([stocks_steady, bonds_steady, cash_steady])
-
-
-def run_simulation(params, initial_state=None, time_points=None):
-    """Run the capital flow simulation (original continuous integration fallback)."""
-    time_horizon = params.get("simulation_time_horizon", 200.0)
-    if time_points is None:
-        time_points = np.linspace(0.0, time_horizon, 1001)
-    
-    if initial_state is None:
-        total_capital = params.get("total_capital", 1.0)
-        initial_stocks = params.get("initial_stocks_fraction", 0.5)
-        initial_bonds = params.get("initial_bonds_fraction", 0.3)
-        initial_state = [initial_stocks * total_capital, initial_bonds * total_capital]
-    
-    solution = solve_ivp(
-        fun=lambda t, y: capital_flow_ode(t, y, params),
-        t_span=(time_points[0], time_points[-1]),
-        y0=initial_state,
-        t_eval=time_points,
-        method="RK45",
-        atol=1e-8, 
-        rtol=1e-6
-    )
-    
-    if not solution.success:
-        raise RuntimeError(f"ODE solver failed: {solution.message}")
-    
-    stocks_over_time = solution.y[0]
-    bonds_over_time = solution.y[1]
-    total_capital = params.get("total_capital", 1.0)
-    cash_over_time = total_capital - stocks_over_time - bonds_over_time
-    
-    results_dataframe = pd.DataFrame({
-        "time": solution.t,
-        "stocks": stocks_over_time,
-        "bonds": bonds_over_time,
-        "cash": cash_over_time,
-        "risk_free_rate": [risk_free_rate(t, params) for t in solution.t],
-        "stock_return": [stock_return(risk_free_rate(t, params), params) for t in solution.t],
-        "bond_return": [bond_return(risk_free_rate(t, params), params) for t in solution.t],
-    })
-    
-    return solution, results_dataframe
-
-
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
@@ -928,7 +825,8 @@ def main():
     st.set_page_config(page_title="Capital Flow Model", layout="wide", page_icon="📈")
     
     st.title("📈 Enhanced Capital Flow Model")
-    st.markdown("*Monthly time-series integration with diagnostics, stability analysis, and quarterly reporting*")
+    st.markdown("*Funded allocation transfers — time in years, fixed capital budget K*")
+    st.info("Returns guide allocation transfers; this model does not compound wealth or price bonds by duration. Uploaded monthly values describe historical forcing, not a trading backtest.")
     
     # ========================================================================
     # SIDEBAR: Configuration
@@ -954,13 +852,17 @@ def main():
         is_annual = st.sidebar.checkbox(
             "Rates are annual?",
             value=True,
-            help="Check if rates are annual (will divide by 12 for monthly)"
+            help="Annual inputs stay annual; monthly continuous rates are multiplied by 12."
         )
         
+        rate_convention = st.sidebar.selectbox("Input convention", ["continuous", "effective"],
+            help="Effective returns are converted with log1p. Use bond total-return assumptions, not bond yields.")
+
         try:
             raw_df = pd.read_csv(uploaded_file)
-            timeseries_df = preprocess_timeseries(raw_df, is_percent, is_annual)
+            timeseries_df = preprocess_timeseries(raw_df, is_percent, is_annual, rate_convention)
             st.sidebar.success(f"✅ Loaded {len(timeseries_df)} months of data")
+            st.sidebar.caption(f"Past-only carried rate cells: {timeseries_df.attrs.get('imputed_cells', 0)}")
             st.sidebar.info(f"Date range: {timeseries_df.index[0].strftime('%Y-%m')} to {timeseries_df.index[-1].strftime('%Y-%m')}")
         except Exception as e:
             st.sidebar.error(f"❌ Error processing CSV: {str(e)}")
@@ -999,28 +901,28 @@ def main():
         )
         
         params["cash_to_stocks_baseline_flow"] = st.number_input(
-            "Cash→Stocks Flow β_s",
+            "Cash→Stocks Flow β_s (per year)",
             min_value=0.0, max_value=1.0,
             value=params["cash_to_stocks_baseline_flow"],
             step=0.01, format="%.4f"
         )
         
         params["cash_to_bonds_baseline_flow"] = st.number_input(
-            "Cash→Bonds Flow β_b",
+            "Cash→Bonds Flow β_b (per year)",
             min_value=0.0, max_value=1.0,
             value=params["cash_to_bonds_baseline_flow"],
             step=0.01, format="%.4f"
         )
         
         params["stock_natural_decay_rate"] = st.number_input(
-            "Stock Decay γ_s",
+            "Stock Decay γ_s (per year)",
             min_value=0.0, max_value=1.0,
             value=params["stock_natural_decay_rate"],
             step=0.01, format="%.4f"
         )
         
         params["bond_natural_decay_rate"] = st.number_input(
-            "Bond Decay γ_b",
+            "Bond Decay γ_b (per year)",
             min_value=0.0, max_value=1.0,
             value=params["bond_natural_decay_rate"],
             step=0.01, format="%.4f"
@@ -1115,14 +1017,14 @@ def main():
                 
                 if params["risk_free_rate_type"] == "step":
                     params["risk_free_rate_shock_time"] = st.number_input(
-                        "Shock Time",
+                        "Shock Time (years)",
                         min_value=0.0, max_value=500.0,
                         value=params["risk_free_rate_shock_time"],
                         step=1.0, format="%.1f"
                     )
             
             params["simulation_time_horizon"] = st.number_input(
-                "Time Horizon",
+                "Time Horizon (years)",
                 min_value=1.0, max_value=1000.0,
                 value=params["simulation_time_horizon"],
                 step=10.0, format="%.1f"
@@ -1140,6 +1042,7 @@ def main():
             with st.spinner("Running simulation..."):
                 try:
                     if timeseries_df is not None:
+                        st.session_state.pop('monthly_ss', None)
                         # Piecewise monthly integration
                         results_df = run_simulation_with_timeseries(
                             params, timeseries_df, steps_per_month
@@ -1154,6 +1057,9 @@ def main():
                     else:
                         # Continuous integration fallback
                         solution, results_df = run_simulation(params)
+                        st.session_state['diagnostics'] = add_diagnostics(results_df, params)
+                        st.session_state.pop('timeseries_df', None)
+                        st.session_state.pop('monthly_ss', None)
                         st.session_state['results_df'] = results_df
                         st.session_state['params'] = params
                         st.session_state['using_timeseries'] = False
@@ -1270,7 +1176,7 @@ def main():
         
         st.markdown("##### Stability Analysis")
         eigs = ss_results['eigenvalues']
-        stability_status = "Stable ✅" if ss_results['stability_flag'] else "Unstable ⚠️"
+        stability_status = "Frozen-rate asymptotically stable ✅" if ss_results['stability_flag'] else "Not strictly asymptotically stable"
         
         st.write(f"**Eigenvalues:** λ₁ = {eigs[0]:.6f}, λ₂ = {eigs[1]:.6f}")
         st.write(f"**Real parts:** Re(λ₁) = {np.real(eigs[0]):.6f}, Re(λ₂) = {np.real(eigs[1]):.6f}")
@@ -1305,11 +1211,11 @@ def main():
             
             with diag_col3:
                 if diagnostics['bankruptcy_occurred']:
-                    st.error("❌ Bankruptcy Event")
+                    st.error("❌ Negative allocation detected")
                     if diagnostics['first_bankruptcy_time'] is not None:
                         st.caption(f"First at t={diagnostics['first_bankruptcy_time']:.2f}")
                 else:
-                    st.success("✅ No Bankruptcy")
+                    st.success("✅ Allocations nonnegative")
             
             with diag_col4:
                 if diagnostics['clamping_occurred']:
@@ -1333,29 +1239,33 @@ def main():
             ax1.plot(results_df["time"], results_df["stocks"], label="Stocks", linewidth=2)
             ax1.plot(results_df["time"], results_df["bonds"], label="Bonds", linewidth=2)
             ax1.plot(results_df["time"], results_df["cash"], label="Cash", linewidth=2)
-            ax1.set_xlabel("Time (months)" if using_timeseries else "Time", fontsize=12)
+            ax1.set_xlabel("Time (years)", fontsize=12)
             ax1.set_ylabel("Capital Allocation", fontsize=12)
             ax1.set_title("Capital Allocation Over Time", fontsize=14, fontweight='bold')
             ax1.legend(fontsize=11)
             ax1.grid(True, alpha=0.3)
             fig1.tight_layout()
             st.pyplot(fig1)
+            plt.close(fig1)
         
         with tab2:
             fig2, ax2 = plt.subplots(figsize=(12, 6))
-            ax2.plot(results_df["time"], results_df["risk_free_rate"], 
-                    label="Risk-Free Rate", linewidth=2)
-            ax2.plot(results_df["time"], results_df["bond_return"], 
-                    label="Bond Return", linewidth=2)
-            ax2.plot(results_df["time"], results_df["stock_return"], 
-                    label="Stock Return", linewidth=2)
-            ax2.set_xlabel("Time (months)" if using_timeseries else "Time", fontsize=12)
-            ax2.set_ylabel("Monthly Return" if using_timeseries else "Annual Return", fontsize=12)
+            rate_plot = ax2.plot if not using_timeseries and st.session_state["params"].get("risk_free_rate_type") == "sin" else ax2.step
+            rate_options = {} if rate_plot == ax2.plot else {"where": "pre" if using_timeseries else "post"}
+            rate_plot(results_df["time"], results_df["risk_free_rate"],
+                    label="Risk-Free Rate", linewidth=2, **rate_options)
+            rate_plot(results_df["time"], results_df["bond_return"],
+                    label="Bond Return", linewidth=2, **rate_options)
+            rate_plot(results_df["time"], results_df["stock_return"],
+                    label="Stock Return", linewidth=2, **rate_options)
+            ax2.set_xlabel("Time (years)", fontsize=12)
+            ax2.set_ylabel("Annual continuous rate", fontsize=12)
             ax2.set_title("Interest Rates and Asset Returns", fontsize=14, fontweight='bold')
             ax2.legend(fontsize=11)
             ax2.grid(True, alpha=0.3)
             fig2.tight_layout()
             st.pyplot(fig2)
+            plt.close(fig2)
         
         with tab3:
             fig3, ax3 = plt.subplots(figsize=(10, 8))
@@ -1371,6 +1281,7 @@ def main():
             ax3.grid(True, alpha=0.3)
             fig3.tight_layout()
             st.pyplot(fig3)
+            plt.close(fig3)
         
         with tab4:
             if using_timeseries and 'timeseries_df' in st.session_state:
@@ -1413,8 +1324,6 @@ def main():
                 st.info("Click '📅 Monthly Steady States' above to compute monthly steady-state and stability.")
     else:
         st.info("👆 Click 'Run Simulation' to see results")
-
-
 
 if __name__ == "__main__":
     main()
