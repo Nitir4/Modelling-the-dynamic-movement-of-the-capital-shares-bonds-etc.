@@ -5,7 +5,7 @@ capital_flow_streamlit_app.py
 Enhanced Streamlit web app for Capital Flow Model with time-series integration,
 diagnostics, stability analysis, and quarterly reporting.
 
-Run with: streamlit run capital_flow_streamlit_app.py
+Run with: streamlit run streamlit_main.py
 
 Sample CSV format for time-series upload:
 date,rf,rs,rb
@@ -18,22 +18,25 @@ CSV columns:
 - date: Any parseable date format (YYYY-MM-DD, MM/DD/YYYY, etc.)
 - rf: Risk-free rate (repo rate)
 - rs: Stock/equity return
-- rb: Bond yield/return
+- rb: Expected bond total-return incentive, not a bond yield
 
 Use checkboxes to indicate:
 - Whether rates are in percent (will divide by 100)
-- Whether rates are annual (will divide by 12 for monthly)
+- Whether rates are annual or monthly; all inputs are converted to annual continuous rates
+- Whether inputs are continuous rates or effective returns (log1p conversion)
 """
 
 import numpy as np
 import pandas as pd
 from scipy.integrate import solve_ivp
-from scipy.optimize import root
-from numpy.linalg import eigvals
 import matplotlib.pyplot as plt
 import streamlit as st
-from datetime import datetime
-
+from capital_model import (
+    risk_free_rate, stock_return, bond_return, capital_flow_ode,
+    preprocess_timeseries, run_simulation_with_timeseries, add_diagnostics,
+    jacobian_and_stability_at, steady_state_one_month, generate_quarterly_summary,
+    steady_state, run_simulation,
+)
 
 # ============================================================================
 # DEFAULT PARAMETERS
@@ -50,114 +53,23 @@ DEFAULT_PARAMS = {
     "baseline_stock_return": 0.08,                  # r_s^0
     "baseline_bond_return": 0.04,                   # r_b^0
     "lambda_s": -0.10,                              # sensitivity of stocks to rf
-    "bond_duration_years": 5.0,
     
     "total_capital": 1.0,                           # K
     
     "risk_free_rate_baseline": 0.06,                # r_f^0
     "risk_free_rate_shock_magnitude": 0.02,
-    "risk_free_rate_shock_time": 20.0,
+    "risk_free_rate_shock_time": 2.0,
     "risk_free_rate_type": "step",
-    "risk_free_rate_sine_period": 60.0,
-    "simulation_time_horizon": 200.0,
+    "risk_free_rate_sine_period": 6.0,
+    "simulation_time_horizon": 20.0,
     
     "initial_stocks_fraction": 0.5,
     "initial_bonds_fraction": 0.3,
 }
 
-
 # ============================================================================
-# CORE ODE MODEL (UNCHANGED)
+# FUNDED TRANSFER CORE — imported from capital_model.py
 # ============================================================================
-
-def risk_free_rate(time, params):
-    """Calculate time-varying risk-free rate."""
-    rate_type = params.get("risk_free_rate_type", "constant")
-    baseline_rate = params.get("risk_free_rate_baseline", 0.04)
-    
-    if rate_type == "constant":
-        return baseline_rate
-    elif rate_type == "step":
-        shock_time = params.get("risk_free_rate_shock_time", 20.0)
-        shock_magnitude = params.get("risk_free_rate_shock_magnitude", 0.02)
-        if time >= shock_time:
-            return baseline_rate + shock_magnitude
-        else:
-            return baseline_rate
-    elif rate_type == "sin":
-        period = params.get("risk_free_rate_sine_period", 60.0)
-        amplitude = params.get("risk_free_rate_shock_magnitude", 0.01)
-        return baseline_rate + amplitude * np.sin(2 * np.pi * time / period)
-    else:
-        raise ValueError(f"Unknown risk_free_rate_type: {rate_type}")
-
-
-def stock_return(current_risk_free_rate, params):
-    """Calculate expected stock return based on risk-free rate."""
-    baseline_stock_return = params.get("baseline_stock_return", 0.08)
-    stock_rate_sensitivity = params.get("lambda_s", -0.1)
-    baseline_risk_free = params.get("risk_free_rate_baseline", 0.04)
-    
-    rate_delta = current_risk_free_rate - baseline_risk_free
-    return baseline_stock_return + stock_rate_sensitivity * rate_delta
-
-
-def bond_return(current_risk_free_rate, params):
-    """Calculate bond return based on risk-free rate and spread."""
-    baseline_bond_return = params.get("baseline_bond_return", 0.04)
-    baseline_risk_free = params.get("risk_free_rate_baseline", 0.04)
-    
-    spread = baseline_bond_return - baseline_risk_free
-    return current_risk_free_rate + spread
-
-
-def capital_flow_ode(time, state, params, fixed_rf=None, fixed_rs=None, fixed_rb=None):
-    """
-    Define the system of ODEs for capital flows.
-    
-    state = [stocks_capital, bonds_capital]
-    cash_capital = K - stocks_capital - bonds_capital
-    
-    dS/dt = α_s (r_s - r_f) S + β_s C - γ_s S
-    dB/dt = α_b (r_b - r_f) B + β_b C - γ_b B
-    
-    Returns: [dS/dt, dB/dt]
-    """
-    stocks_capital, bonds_capital = state
-    total_capital = params.get("total_capital", 1.0)
-    cash_capital = total_capital - stocks_capital - bonds_capital
-    
-    # Use fixed rates if provided (for piecewise integration), otherwise compute
-    if fixed_rf is not None:
-        current_risk_free = fixed_rf
-        current_stock_return = fixed_rs
-        current_bond_return = fixed_rb
-    else:
-        current_risk_free = risk_free_rate(time, params)
-        current_stock_return = stock_return(current_risk_free, params)
-        current_bond_return = bond_return(current_risk_free, params)
-    
-    # Extract parameters
-    alpha_s = params.get("stock_sensitivity_to_excess_return", 0.5)
-    alpha_b = params.get("bond_sensitivity_to_excess_return", 0.4)
-    beta_s = params.get("cash_to_stocks_baseline_flow", 0.02)
-    beta_b = params.get("cash_to_bonds_baseline_flow", 0.03)
-    gamma_s = params.get("stock_natural_decay_rate", 0.01)
-    gamma_b = params.get("bond_natural_decay_rate", 0.01)
-    
-    stock_excess_return = current_stock_return - current_risk_free
-    bond_excess_return = current_bond_return - current_risk_free
-    
-    dS_dt = (alpha_s * stock_excess_return * stocks_capital + 
-             beta_s * cash_capital - 
-             gamma_s * stocks_capital)
-    
-    dB_dt = (alpha_b * bond_excess_return * bonds_capital + 
-             beta_b * cash_capital - 
-             gamma_b * bonds_capital)
-    
-    return [dS_dt, dB_dt]
-
 
 # ============================================================================
 # A — TIME-SERIES UPLOADER & PREPROCESSING
