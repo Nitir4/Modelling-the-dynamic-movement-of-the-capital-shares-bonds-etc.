@@ -40,20 +40,21 @@ from datetime import datetime
 # ============================================================================
 
 DEFAULT_PARAMS = {
-    "stock_sensitivity_to_excess_return": 0.5,      # α_s
+    "stock_sensitivity_to_excess_return": 0.75,      # α_s
     "bond_sensitivity_to_excess_return": 0.4,       # α_b
-    "cash_to_stocks_baseline_flow": 0.02,           # β_s
+    "cash_to_stocks_baseline_flow": 0.03,           # β_s
     "cash_to_bonds_baseline_flow": 0.03,            # β_b
-    "stock_natural_decay_rate": 0.01,               # γ_s
+    "stock_natural_decay_rate": 0.015,              # γ_s
     "bond_natural_decay_rate": 0.01,                # γ_b
     
-    "baseline_stock_return": 0.08,
-    "baseline_bond_return": 0.04,
+    "baseline_stock_return": 0.08,                  # r_s^0
+    "baseline_bond_return": 0.04,                   # r_b^0
+    "lambda_s": -0.10,                              # sensitivity of stocks to rf
     "bond_duration_years": 5.0,
     
     "total_capital": 1.0,                           # K
     
-    "risk_free_rate_baseline": 0.04,
+    "risk_free_rate_baseline": 0.06,                # r_f^0
     "risk_free_rate_shock_magnitude": 0.02,
     "risk_free_rate_shock_time": 20.0,
     "risk_free_rate_type": "step",
@@ -429,25 +430,27 @@ def add_diagnostics(results_df, params):
 # D — JACOBIAN & STABILITY ANALYSIS
 # ============================================================================
 
-def jacobian_and_stability_at(stocks_value, bonds_value, params, fixed_rf):
+def jacobian_and_stability_at(stocks_value, bonds_value, params, rf, rs, rb):
     """
-    Compute Jacobian matrix and stability at a given point.
-    
-    For the linear system with fixed rates:
-    J11 = α_s*(r_s - r_f) - β_s - γ_s
-    J12 = -β_s
-    J21 = -β_b
-    J22 = α_b*(r_b - r_f) - β_b - γ_b
-    
+    Compute Jacobian matrix and stability at a given point using actual rates.
+
+    Inputs:
+        stocks_value: S* (steady-state stocks)
+        bonds_value:  B* (steady-state bonds)
+        params:       parameter dict
+        rf, rs, rb:   risk-free rate, stock return, bond return for that period
+
+    For the linearized system with fixed rates:
+        J11 = α_s*(r_s - r_f) - β_s - γ_s
+        J12 = -β_s
+        J21 = -β_b
+        J22 = α_b*(r_b - r_f) - β_b - γ_b
+
     Returns:
         jacobian: 2x2 numpy array
         eigenvalues: array of eigenvalues
         stability_flag: True if all real parts < 0
     """
-    # Get current returns at fixed rf
-    current_stock_return = stock_return(fixed_rf, params)
-    current_bond_return = bond_return(fixed_rf, params)
-    
     # Extract parameters
     alpha_s = params.get("stock_sensitivity_to_excess_return", 0.5)
     alpha_b = params.get("bond_sensitivity_to_excess_return", 0.4)
@@ -455,21 +458,109 @@ def jacobian_and_stability_at(stocks_value, bonds_value, params, fixed_rf):
     beta_b = params.get("cash_to_bonds_baseline_flow", 0.03)
     gamma_s = params.get("stock_natural_decay_rate", 0.01)
     gamma_b = params.get("bond_natural_decay_rate", 0.01)
-    
-    # Compute Jacobian entries
-    J11 = alpha_s * (current_stock_return - fixed_rf) - beta_s - gamma_s
+
+    # Excess returns based on actual data
+    stock_excess = rs - rf
+    bond_excess = rb - rf
+
+    # Jacobian entries
+    J11 = alpha_s * stock_excess - beta_s - gamma_s
     J12 = -beta_s
     J21 = -beta_b
-    J22 = alpha_b * (current_bond_return - fixed_rf) - beta_b - gamma_b
-    
-    jacobian = np.array([[J11, J12], [J21, J22]])
-    
-    # Compute eigenvalues and stability
+    J22 = alpha_b * bond_excess - beta_b - gamma_b
+
+    jacobian = np.array([[J11, J12],
+                         [J21, J22]])
+
     eigenvalues = eigvals(jacobian)
     stability_flag = all(np.real(eigenvalues) < 0)
-    
+
     return jacobian, eigenvalues, stability_flag
 
+# ============================================================================
+# D2 — MONTHLY STEADY STATE (DATA-DRIVEN)
+# ============================================================================
+
+def steady_state_one_month(params, rf, rs, rb, initial_guess=None):
+    """
+    Solve dS/dt = 0, dB/dt = 0 for a single month using that month's rf, rs, rb.
+    Returns (S, B, C) or None if the solver fails.
+    """
+    total_capital = params.get("total_capital", 1.0)
+
+    alpha_s = params.get("stock_sensitivity_to_excess_return", 0.5)
+    alpha_b = params.get("bond_sensitivity_to_excess_return", 0.4)
+    beta_s = params.get("cash_to_stocks_baseline_flow", 0.02)
+    beta_b = params.get("cash_to_bonds_baseline_flow", 0.03)
+    gamma_s = params.get("stock_natural_decay_rate", 0.01)
+    gamma_b = params.get("bond_natural_decay_rate", 0.01)
+
+    def residuals(x):
+        S, B = x
+        C = total_capital - S - B
+        stock_excess = rs - rf
+        bond_excess  = rb - rf
+        dS = alpha_s * stock_excess * S + beta_s * C - gamma_s * S
+        dB = alpha_b * bond_excess  * B + beta_b * C - gamma_b * B
+        return [dS, dB]
+
+    if initial_guess is None:
+        # simple neutral guess
+        initial_guess = [0.5 * total_capital, 0.3 * total_capital]
+
+    sol = root(residuals, x0=initial_guess, method="hybr")
+    if not sol.success:
+        return None
+
+    S, B = sol.x
+    C = total_capital - S - B
+    return S, B, C
+
+
+def steady_state_for_each_month(params, timeseries_df):
+    """
+    Compute steady state and stability for each month in the uploaded time-series.
+    Returns a DataFrame with columns: date, S, B, C, eig1, eig2, stable.
+    """
+    results = []
+
+    prev_guess = None
+
+    for idx, row in timeseries_df.iterrows():
+        rf = row["risk_free_rate"]
+        rs = row["stock_return"]
+        rb = row["bond_return"]
+
+        ss = steady_state_one_month(params, rf, rs, rb, initial_guess=prev_guess)
+        if ss is None:
+            results.append({
+                "date": idx,
+                "S": np.nan,
+                "B": np.nan,
+                "C": np.nan,
+                "eig1": np.nan,
+                "eig2": np.nan,
+                "stable": False
+            })
+            prev_guess = None
+            continue
+
+        S, B, C = ss
+        prev_guess = [S, B]
+
+        J, eigs, stable = jacobian_and_stability_at(S, B, params, rf, rs, rb)
+
+        results.append({
+            "date": idx,
+            "S": S,
+            "B": B,
+            "C": C,
+            "eig1": eigs[0],
+            "eig2": eigs[1],
+            "stable": stable
+        })
+
+    return pd.DataFrame(results)
 
 # ============================================================================
 # E — EMBEDDED UNIT TESTS
@@ -609,84 +700,117 @@ def run_unit_tests(params):
 def generate_quarterly_summary(results_df, timeseries_df, params):
     """
     Generate quarter-by-quarter summary with interpretation sentences.
-    
-    Returns:
-        DataFrame with quarterly aggregations and list of interpretation sentences
+    Fixed to avoid deprecated timedelta units ('M', 'Y').
+    Uses DateOffset for month jumps.
     """
-    # Add date column based on time (assuming time 0 = first month)
-    start_date = timeseries_df.index[0]
-    results_df['date'] = pd.to_datetime(start_date) + pd.to_timedelta(results_df['time'], unit='M')
-    
-    # Assign quarters
-    results_df['quarter'] = results_df['date'].dt.to_period('Q')
-    
-    # Group by quarter
+
+    # ---------------------------
+    # 1. Convert simulation time -> real calendar dates
+    # ---------------------------
+    start_date = pd.to_datetime(timeseries_df.index[0])
+    base_date = start_date
+
+    # Convert each time value t into: base_date + t months
+    sim_dates = []
+    for t in results_df["time"]:
+        whole_months = int(t)
+        fractional = t - whole_months
+
+        # Add whole months
+        d = base_date + pd.DateOffset(months=whole_months)
+
+        # Add fractional month using approx 30 days (safe and acceptable)
+        if fractional > 0:
+            d = d + pd.Timedelta(days=30 * fractional)
+
+        sim_dates.append(d)
+
+    results_df["date"] = sim_dates
+
+    # ---------------------------
+    # 2. Assign calendar quarters
+    # ---------------------------
+    results_df["quarter"] = results_df["date"].dt.to_period("Q")
+
     quarterly_data = []
-    
-    for quarter, group in results_df.groupby('quarter'):
-        quarter_start_date = group['date'].min()
-        quarter_end_date = group['date'].max()
-        
-        S_start = group['stocks'].iloc[0]
-        S_end = group['stocks'].iloc[-1]
+
+    # ---------------------------
+    # 3. Group by quarter
+    # ---------------------------
+    for quarter, group in results_df.groupby("quarter"):
+        quarter_start_date = group["date"].min()
+        quarter_end_date = group["date"].max()
+
+        S_start = group["stocks"].iloc[0]
+        S_end = group["stocks"].iloc[-1]
         delta_S = S_end - S_start
-        
-        B_start = group['bonds'].iloc[0]
-        B_end = group['bonds'].iloc[-1]
+
+        B_start = group["bonds"].iloc[0]
+        B_end = group["bonds"].iloc[-1]
         delta_B = B_end - B_start
-        
-        avg_rf = group['risk_free_rate'].mean()
-        avg_rs = group['stock_return'].mean()
-        avg_rb = group['bond_return'].mean()
-        
-        total_flow_to_stocks = group['dS_dt'].sum()
-        
-        # Compute stability for this quarter
-        mid_S = group['stocks'].iloc[len(group)//2]
-        mid_B = group['bonds'].iloc[len(group)//2]
-        mid_rf = group['risk_free_rate'].iloc[len(group)//2]
-        
+
+        avg_rf = group["risk_free_rate"].mean()
+        avg_rs = group["stock_return"].mean()
+        avg_rb = group["bond_return"].mean()
+
+        total_flow_to_stocks = group["dS_dt"].sum()
+
+        # Stability (at middle of quarter)
+        mid = len(group) // 2
+        mid_S  = group["stocks"].iloc[mid]
+        mid_B  = group["bonds"].iloc[mid]
+        mid_rf = group["risk_free_rate"].iloc[mid]
+        mid_rs = group["stock_return"].iloc[mid]
+        mid_rb = group["bond_return"].iloc[mid]
+
         try:
-            _, eigenvalues, stability_flag = jacobian_and_stability_at(
-                mid_S, mid_B, params, mid_rf
+            _, eigenvalues, stable = jacobian_and_stability_at(
+                mid_S, mid_B, params, mid_rf, mid_rs, mid_rb
             )
-            stability_status = "Stable" if stability_flag else "Unstable"
-        except:
-            stability_status = "Unknown"
-        
+            stability = "Stable" if stable else "Unstable"
+        except Exception:
+            stability = "Unknown"
+
+
         quarterly_data.append({
-            'quarter': str(quarter),
-            'start_date': quarter_start_date.strftime('%Y-%m-%d'),
-            'end_date': quarter_end_date.strftime('%Y-%m-%d'),
-            'delta_S': delta_S,
-            'delta_B': delta_B,
-            'avg_rf': avg_rf,
-            'avg_rs': avg_rs,
-            'avg_rb': avg_rb,
-            'total_flow_to_stocks': total_flow_to_stocks,
-            'stability': stability_status
+            "quarter": str(quarter),
+            "start_date": quarter_start_date.strftime("%Y-%m-%d"),
+            "end_date": quarter_end_date.strftime("%Y-%m-%d"),
+            "delta_S": delta_S,
+            "delta_B": delta_B,
+            "avg_rf": avg_rf,
+            "avg_rs": avg_rs,
+            "avg_rb": avg_rb,
+            "total_flow_to_stocks": total_flow_to_stocks,
+            "stability": stability
         })
-    
+
     quarterly_df = pd.DataFrame(quarterly_data)
-    
-    # Generate interpretation sentences
+
+    # ---------------------------
+    # 4. Build one-line interpretations
+    # ---------------------------
     interpretations = []
+
     for _, row in quarterly_df.iterrows():
-        quarter_str = row['quarter']
-        year = quarter_str[:4]
-        q_num = quarter_str[-2:]
-        
-        rotation_type = "rotation into stocks" if row['delta_S'] > 0 else "flight to safety"
-        avg_spread = row['avg_rs'] - row['avg_rf']
-        
-        sentence = (f"{q_num} {year}: Net {rotation_type} — "
-                   f"ΔS = {row['delta_S']:.3%}; "
-                   f"driven by avg spread (r_s−r_f) = {avg_spread:.3%}. "
-                   f"System stability: {row['stability']}.")
-        
+        quarter_label = row["quarter"]
+        year = quarter_label[:4]
+        q_number = quarter_label[-2:]
+
+        rotation = "rotation into stocks" if row["delta_S"] > 0 else "flight to safety"
+        avg_spread = row["avg_rs"] - row["avg_rf"]
+
+        sentence = (
+            f"{q_number} {year}: Net {rotation} — "
+            f"ΔS = {row['delta_S']:.3%}; "
+            f"driven by avg spread (r_s − r_f) = {avg_spread:.3%}. "
+            f"System stability: {row['stability']}."
+        )
+
         interpretations.append(sentence)
-    
+
     return quarterly_df, interpretations
+
 
 
 # ============================================================================
@@ -923,6 +1047,47 @@ def main():
             value=params["total_capital"],
             step=0.1, format="%.2f"
         )
+    with st.sidebar.expander("📐 Steady-State / Return Parameters", expanded=False):
+        params["baseline_stock_return"] = st.number_input(
+            "Baseline Stock Return r_s⁰",
+            min_value=-1.0, max_value=1.0,
+            value=params["baseline_stock_return"],
+            step=0.01, format="%.4f",
+            help="Long-run annual stock return used in steady-state when no data is given."
+        )
+
+        params["baseline_bond_return"] = st.number_input(
+            "Baseline Bond Return r_b⁰",
+            min_value=-1.0, max_value=1.0,
+            value=params["baseline_bond_return"],
+            step=0.01, format="%.4f",
+            help="Long-run annual bond return used in steady-state when no data is given."
+        )
+
+        params["lambda_s"] = st.number_input(
+            "Stock Rate Sensitivity λ_s",
+            min_value=-5.0, max_value=5.0,
+            value=params.get("lambda_s", -0.10),
+            step=0.01, format="%.3f",
+            help="How much the expected stock return moves when the risk-free rate moves."
+        )
+
+        params["risk_free_rate_baseline"] = st.number_input(
+            "Baseline Risk-Free Rate r_f⁰",
+            min_value=-0.5, max_value=1.0,
+            value=params["risk_free_rate_baseline"],
+            step=0.01, format="%.4f",
+            help="Baseline risk-free rate used in steady-state and default simulations."
+        )
+
+        params["risk_free_rate_shock_magnitude"] = st.number_input(
+            "Shock Magnitude Δr_f",
+            min_value=-0.5, max_value=1.0,
+            value=params["risk_free_rate_shock_magnitude"],
+            step=0.01, format="%.4f",
+            help="Size of permanent rate shock used in the pre/post steady-state comparison."
+        )
+
     
     # Only show these if no timeseries
     if timeseries_df is None:
@@ -967,7 +1132,8 @@ def main():
     # MAIN AREA: Action Buttons
     # ========================================================================
     
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+
     
     with col1:
         if st.button("🚀 Run Simulation", type="primary", use_container_width=True):
@@ -1005,11 +1171,17 @@ def main():
                     
                     pre_shock_ss = steady_state(params, fixed_risk_free_rate=pre_shock_rate)
                     post_shock_ss = steady_state(params, fixed_risk_free_rate=post_shock_rate, 
-                                                initial_guess=pre_shock_ss[:2])
+                                                 initial_guess=pre_shock_ss[:2])
+
+                    # Compute rs, rb implied by the post-shock rf for this theoretical analysis
+                    post_rs = stock_return(post_shock_rate, params)
+                    post_rb = bond_return(post_shock_rate, params)
                     
                     jacobian_matrix, eigenvalues, stability_flag = jacobian_and_stability_at(
-                        post_shock_ss[0], post_shock_ss[1], params, post_shock_rate
+                        post_shock_ss[0], post_shock_ss[1], params,
+                        post_shock_rate, post_rs, post_rb
                     )
+
                     
                     st.session_state['steady_state_results'] = {
                         'pre_shock_rate': pre_shock_rate,
@@ -1038,7 +1210,19 @@ def main():
                         st.warning("⚠️ Some tests failed")
                 except Exception as e:
                     st.error(f"❌ Tests failed: {str(e)}")
-    
+    with col4:
+        if st.button("📅 Monthly Steady States", use_container_width=True):
+            with st.spinner("Computing monthly steady states..."):
+                try:
+                    if timeseries_df is None:
+                        st.error("Upload time-series data first.")
+                    else:
+                        ss_monthly = steady_state_for_each_month(params, timeseries_df)
+                        st.session_state["monthly_ss"] = ss_monthly
+                        st.success("✅ Monthly steady states computed!")
+                except Exception as e:
+                    st.error(f"❌ Monthly steady-state computation failed: {str(e)}")
+
     # ========================================================================
     # DISPLAY: Test Results
     # ========================================================================
@@ -1134,13 +1318,15 @@ def main():
                     st.success("✅ No clamping needed")
         
         # Tabs for different views
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "📈 Capital Allocation", 
             "💹 Rates & Returns", 
             "🔄 Phase Diagram",
             "📅 Quarterly Summary",
-            "📋 Data Table"
+            "📋 Data Table",
+            "🧮 Monthly Steady State"
         ])
+
         
         with tab1:
             fig1, ax1 = plt.subplots(figsize=(12, 6))
@@ -1217,8 +1403,17 @@ def main():
                 file_name="capital_flow_results_enhanced.csv",
                 mime="text/csv",
             )
+    
+
+        with tab6:
+            if "monthly_ss" in st.session_state:
+                st.markdown("##### 🧮 Monthly Steady-State (Data-Driven)")
+                st.dataframe(st.session_state["monthly_ss"], use_container_width=True)
+            else:
+                st.info("Click '📅 Monthly Steady States' above to compute monthly steady-state and stability.")
     else:
         st.info("👆 Click 'Run Simulation' to see results")
+
 
 
 if __name__ == "__main__":
